@@ -32,6 +32,7 @@ Dependency:
 - perl >=5.8 with built-in modules (required by Git)
 - sort (any version) (required by Git)
 - Linux::ACL module, or getfacl/setfacl (optional, for manipulating ACL metadata)
+- File::ExtAttr module, or getfattr/setfattr (optional, for manipulating extended attributes)
 - File::lchown module, or touch/chown (optional, for applying metadata to symbolic links)
 
 Usage:

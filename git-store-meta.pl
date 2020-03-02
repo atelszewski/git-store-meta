@@ -45,6 +45,7 @@
 #   uid     user ID (if user is also set, prefer user and fallback to uid)
 #   gid     group ID (if group is also set, prefer group and fallback to gid)
 #   acl     access control lists for POSIX setfacl/getfacl
+#   fattr   extended attributes for LINUX setfattr/getfattr 
 #
 # git-store-meta 2.1.1
 # Copyright (c) 2015-2020, Danny Lin
@@ -70,7 +71,7 @@ my $GIT_STORE_META_APP       = "git-store-meta";
 my $GIT_STORE_META_FILENAME  = ".git_store_meta";
 my $GIT                      = "git";
 my @ACTIONS = ('help', 'version', 'install', 'update', 'store', 'apply');
-my @FIELDS = ('file', 'type', 'mtime', 'atime', 'mode', 'uid', 'gid', 'user', 'group', 'acl');
+my @FIELDS = ('file', 'type', 'mtime', 'atime', 'mode', 'uid', 'gid', 'user', 'group', 'acl', 'fattr');
 my %CONFIGS = (
     directory => undef,
     topdir => undef,
@@ -99,6 +100,8 @@ my $touch;
 my $chown;
 my $getfacl;
 my $setfacl;
+my $getfattr;
+my $setfattr;
 
 my $configs;
 
@@ -300,6 +303,13 @@ prepare_subroutines: {
     } else {
         $getfacl = \&getfacl_external;
         $setfacl = \&setfacl_external;
+    }
+    if (eval { require File::ExtAttr; }) {
+        $getfattr = \&getfattr_internal;
+        $setfattr = \&setfattr_internal;
+    } else {
+        $getfattr = \&getfattr_external;
+        $setfattr = \&setfattr_external;
     }
 }
 
@@ -562,6 +572,135 @@ sub setfacl_external {
     return ($? == 0);
 }
 
+# getfattr can access all extended attributes, some of which are used by the
+# system, such as ACL (system.posix_acl_access). Currently we support only the
+# most used "user" namespace to prevent an explioit.
+#
+# Format of getfattr:
+#
+#     # file: <file>
+#     <name>="<value>"
+#     <name>=0x<hex>
+#     <name>=0s<base64>
+#
+#     <file>: "\n" => "\012", "\r" => "\015", "\" => "\134"
+#     <name>: "\n" => "\012", "\r" => "\015", "=" => "\075", "\" => "\134"
+#     <value>: "\0" => "\000", "\n" => "\012", "\r" => "\015", '"' => '\"', "\" => "\\"
+#
+# Serialization: escape control chars, "\", "=" (name), and '"' (value) using
+#      \{oct}, and join lines with "\n".
+sub getfattr_internal {
+    my ($file) = @_;
+
+    # skip symlink
+    if (-l $file) {
+        return "";
+    }
+
+    my @lines;
+    foreach my $ns ('user') {
+        foreach my $name (File::ExtAttr::listfattr($file, {namespace=>$ns})) {
+            my $value = File::ExtAttr::getfattr($file, $name, {namespace=>$ns});
+            $name =~ s/([\x00-\x1F\x7F=\\])/"\\".sprintf("%03o", ord($1))/eg;
+            $value =~ s/([\x00-\x1F\x7F"\\])/"\\".sprintf("%03o", ord($1))/eg;
+            my $line = "$ns.$name=\"$value\"";
+            push(@lines, $line);
+        }
+    }
+    return join('\n', @lines);
+}
+
+sub getfattr_external {
+    my ($file) = @_;
+    my $cmd = join(" ", ("getfattr", "-Phde", "text", escapeshellarg("./$file"), "2>/dev/null"));
+    $_ = `$cmd`;
+    my @lines = split("\n", $_);
+    shift(@lines); # discard <file> line
+    @lines = map {
+        m/^(.*?)="(.*?)"$/;
+        my $name = $1;
+        my $value = $2;
+        $name =~ s/\\(?:([0-2][0-7]{0,2}|[3-7][0-7]{0,1})|(.))/$1?chr(oct($1)):$2/eg;
+        $name =~ s/([\x00-\x1F\x7F=\\])/"\\".sprintf("%03o", ord($1))/eg;
+        $value =~ s/\\(?:([0-2][0-7]{0,2}|[3-7][0-7]{0,1})|(.))/$1?chr(oct($1)):$2/eg;
+        $value =~ s/([\x00-\x1F\x7F"\\])/"\\".sprintf("%03o", ord($1))/eg;
+        "$name=\"$value\""
+    } @lines;
+    return join('\n', @lines);
+}
+
+sub setfattr_internal {
+    my ($fattr, $file) = @_;
+
+    # skip symlink
+    if (-l $file) {
+        return 1;
+    }
+
+    # flush new attrs
+    my @newattrs;
+    $fattr =~ s/\\n/\n/g;
+    foreach (split("\n", $fattr)) {
+        m/^(.*?)\.(.*?)="(.*?)"$/;
+        my $ns = $1;
+        my $name = $2;
+        my $value = $3;
+        $name =~ s/\\(?:([0-2][0-7]{0,2}|[3-7][0-7]{0,1})|(.))/$1?chr(oct($1)):$2/eg;
+        $value =~ s/\\(?:([0-2][0-7]{0,2}|[3-7][0-7]{0,1})|(.))/$1?chr(oct($1)):$2/eg;
+        File::ExtAttr::setfattr($file, $name, $value, {namespace=>$ns}) or return 0;
+        push(@newattrs, "$ns.$name");
+    }
+
+    # delete old attrs that no longer exist
+    foreach my $ns ('user') {
+        foreach my $name (File::ExtAttr::listfattr($file, {namespace=>$ns})) {
+            if (!(grep { $_ eq "$ns.$name" } @newattrs)) {
+                File::ExtAttr::delfattr($file, $name, {namespace=>$ns}) or return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
+sub setfattr_external {
+    my ($fattr, $file) = @_;
+
+    # get newattrs
+    $fattr =~ s/\\n/\n/g;
+    my @newattrs = map { m/^(.*?)=/; $1 } split("\n", $fattr);
+
+    # get oldattrs
+    my $cmd = join(" ", ("getfattr", "-Phde", "text", escapeshellarg("./$file"), "2>/dev/null"));
+    $_ = `$cmd`;
+    return 0 if ($? != 0);
+    if ($_) {
+        my @lines = split("\n", $_);
+        shift(@lines);
+        my @oldattrs = map { m/^(.*?)=/; $1 } @lines;
+
+        # delete oldattrs that no longer exist
+        my @delattrs = grep { my $a = $_; !(grep { $_ eq $a } @newattrs) } @oldattrs;
+        if (@delattrs) {
+            my @cmds = map { join(" ", ("setfattr", "-hx", escapeshellarg($_), escapeshellarg("./$file"), "2>&1")) } @delattrs;
+            $cmd = join("\n", @cmds);
+            `$cmd`;
+            return 0 if ($? != 0);
+        }
+    }
+
+    # flush new attrs
+    $file =~ s/([\x00-\x1F\x7F\\])/"\\".sprintf("%03o", ord($1))/eg;
+    my $input = "# file: $file\n$fattr";
+    $cmd = join(" ", ("|", "setfattr", "-h", "--restore=-", "2>/dev/null"));
+    if (open my $fh => $cmd) {
+        print $fh $input;
+    } else {
+        return 0;
+    }
+    return ($? == 0);
+}
+
 # Print the initial comment block, from first to second "# ==",
 # with "# " removed
 sub usage {
@@ -758,6 +897,8 @@ sub get_file_metadata {
             push(@rec, $group || "");
         } elsif ($_ eq "acl") {
             push(@rec, &$getfacl($file));
+        } elsif ($_ eq "fattr") {
+            push(@rec, &$getfattr($file));
         }
     }
     return @rec;
@@ -1051,6 +1192,15 @@ sub apply {
                     $check = 1;
                 }
                 warn "warn: `$File' cannot set atime/mtime to $atime_/$mtime_\n" if !$check;
+            }
+            if ($fields_used{'fattr'} && $data{'fattr'} ne "") {
+                print "`$File' set fattr to $data{'fattr'}\n" if $argv{'verbose'};
+                if (!$argv{'dry-run'}) {
+                    $check = &$setfattr($data{'fattr'}, $file);
+                } else {
+                    $check = 1;
+                }
+                warn "warn: `$File' cannot set fattr to $data{'fattr'}\n" if !$check;
             }
         }
         close(GIT_STORE_META_FILE);
